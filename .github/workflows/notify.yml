@@ -1,0 +1,52 @@
+name: Avito → Telegram notifier
+
+on:
+  schedule:
+    # каждые 5 минут (минимально возможный интервал GitHub Actions).
+    # реальный запуск может задерживаться на несколько минут в часы пик — это норма.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # позволяет запускать вручную из вкладки Actions
+
+# нужно, чтобы воркфлоу мог коммитить обновлённый state.json обратно
+permissions:
+  contents: write
+
+# второй запуск не стартует, пока не завершился предыдущий
+concurrency:
+  group: avito-notifier
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run notifier
+        env:
+          AVITO_CLIENT_ID: ${{ secrets.AVITO_CLIENT_ID }}
+          AVITO_CLIENT_SECRET: ${{ secrets.AVITO_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python avito_notifier.py
+
+      - name: Persist state
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update notifier state [skip ci]"
+            git push
+          else
+            echo "state.json не изменился — коммит не нужен"
+          fi
