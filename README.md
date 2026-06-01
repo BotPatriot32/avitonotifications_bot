@@ -38,7 +38,7 @@ git push -u origin main
 
 | Имя секрета            | Значение                                              |
 |------------------------|-------------------------------------------------------|
-| `AVITO_CLIENT_ID`      | `VYBiHo4h6F0j1rrGfbqr`                                 |
+| `AVITO_CLIENT_ID`      | твой client_id приложения Авито                       |
 | `AVITO_CLIENT_SECRET`  | твой client_secret приложения Авито                   |
 | `TELEGRAM_BOT_TOKEN`   | токен бота от @BotFather                               |
 | `TELEGRAM_CHAT_ID`     | твой chat_id (см. ниже, как узнать)                    |
