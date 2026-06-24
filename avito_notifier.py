@@ -25,6 +25,8 @@ import html
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 AVITO_API = "https://api.avito.ru"
 TELEGRAM_API = "https://api.telegram.org"
@@ -32,6 +34,21 @@ TELEGRAM_API = "https://api.telegram.org"
 # Сколько id хранить в памяти, чтобы не слать повторно. Хватает с большим запасом.
 MAX_REMEMBERED = 1000
 REQUEST_TIMEOUT = 30
+
+
+def make_session() -> requests.Session:
+    """Сессия с авто-повтором на временные сбои (таймауты, 429, 5xx)."""
+    s = requests.Session()
+    retry = Retry(
+        total=4,
+        backoff_factor=1,  # паузы 1, 2, 4, 8 сек между попытками
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    return s
 
 
 # --------------------------------------------------------------------------- #
@@ -67,8 +84,8 @@ def save_state(path: str, state: dict) -> None:
 # --------------------------------------------------------------------------- #
 #   Avito                                                                     #
 # --------------------------------------------------------------------------- #
-def avito_token(client_id: str, client_secret: str) -> str:
-    resp = requests.post(
+def avito_token(session: requests.Session, client_id: str, client_secret: str) -> str:
+    resp = session.post(
         f"{AVITO_API}/token/",
         data={
             "grant_type": "client_credentials",
@@ -124,20 +141,36 @@ def avito_orders(session: requests.Session) -> list:
 # --------------------------------------------------------------------------- #
 #   Telegram                                                                  #
 # --------------------------------------------------------------------------- #
-def telegram_send(bot_token: str, chat_id: str, text: str) -> None:
-    resp = requests.post(
-        f"{TELEGRAM_API}/bot{bot_token}/sendMessage",
-        json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not resp.ok:
-        print(f"[error] Telegram вернул {resp.status_code}: {resp.text}")
-    resp.raise_for_status()
+def telegram_send(session: requests.Session, bot_token: str, chat_id: str, text: str) -> str:
+    """
+    Отправка сообщения в Telegram. Не бросает исключений — возвращает статус:
+        "ok"        — отправлено;
+        "temporary" — временный сбой (сеть/таймаут/5xx), стоит повторить позже;
+        "permanent" — постоянная ошибка (например 400), повтор не поможет — пропускаем.
+    Сессия уже с авто-повтором на 429/5xx, так что сюда долетают только итоговые исходы.
+    """
+    try:
+        resp = session.post(
+            f"{TELEGRAM_API}/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"[warn] Telegram недоступен (повторю позже): {e}")
+        return "temporary"
+
+    if resp.ok:
+        return "ok"
+    if resp.status_code in (429, 500, 502, 503, 504):
+        print(f"[warn] Telegram временно вернул {resp.status_code} (повторю позже)")
+        return "temporary"
+    print(f"[error] Telegram вернул {resp.status_code}: {resp.text[:300]} — пропускаю это уведомление")
+    return "permanent"
 
 
 # --------------------------------------------------------------------------- #
@@ -286,40 +319,35 @@ def main() -> int:
 
     state = load_state(state_file)
     first_run = not state["initialized"]
+    session = make_session()
 
-    # 1. Авторизация в Авито
-    token = avito_token(client_id, client_secret)
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {token}"})
-
-    # 2. user_id
-    user_id = os.environ.get("AVITO_USER_ID", "").strip()
-    user_id = int(user_id) if user_id else avito_self_id(session)
+    # 1. Авторизация в Авито (+ user_id). Временный сбой Авито — не повод падать:
+    #    логируем и спокойно выходим, следующий запуск (через пару минут) всё подхватит.
+    try:
+        token = avito_token(session, client_id, client_secret)
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        user_id = os.environ.get("AVITO_USER_ID", "").strip()
+        user_id = int(user_id) if user_id else avito_self_id(session)
+        chats = avito_chats(session, user_id)
+    except requests.RequestException as e:
+        print(f"[warn] Авито временно недоступен, пропускаю цикл: {e}")
+        return 0
 
     sent_messages = set(state["sent_message_ids"])
     sent_orders = set(state["sent_order_ids"])
 
-    new_message_notifications = []
-    new_order_notifications = []
+    # 2. Собираем кандидатов на отправку. Важно: id помечаем "отправленным" НЕ здесь,
+    #    а только после фактической успешной отправки — иначе при сбое будут дубли/пропуски.
+    pending = []  # список (kind, id, text)
 
-    # 3. Сообщения
-    try:
-        for chat in avito_chats(session, user_id):
-            last = chat.get("last_message", {}) or {}
-            msg_id = last.get("id")
-            direction = last.get("direction")  # "in" — входящее от клиента
-            if not msg_id or direction != "in":
-                continue
-            if msg_id in sent_messages:
-                continue
-            sent_messages.add(msg_id)
-            state["sent_message_ids"].append(msg_id)
-            if not first_run:
-                new_message_notifications.append(message_text(chat))
-    except requests.RequestException as e:
-        print(f"[error] не удалось получить чаты: {e}")
+    for chat in chats:
+        last = chat.get("last_message", {}) or {}
+        msg_id = last.get("id")
+        direction = last.get("direction")  # "in" — входящее от клиента
+        if not msg_id or direction != "in" or msg_id in sent_messages:
+            continue
+        pending.append(("msg", msg_id, message_text(chat)))
 
-    # 4. Заказы
     for order in avito_orders(session):
         oid = order.get("id") or order.get("order_id") or order.get("number")
         if oid is None:
@@ -327,34 +355,41 @@ def main() -> int:
         oid = str(oid)
         if oid in sent_orders:
             continue
-        sent_orders.add(oid)
-        state["sent_order_ids"].append(oid)
-        if not first_run:
-            new_order_notifications.append(order_text(order))
+        pending.append(("order", oid, order_text(order)))
 
-    # 5. Отправка
+    # 3. Первый запуск: ничего не шлём, просто запоминаем текущее как «уже виденное».
     if first_run:
+        for kind, _id, _ in pending:
+            (state["sent_message_ids"] if kind == "msg" else state["sent_order_ids"]).append(_id)
         state["initialized"] = True
         save_state(state_file, state)
         telegram_send(
-            bot_token,
-            chat_id,
+            session, bot_token, chat_id,
             "✅ <b>Бот уведомлений Авито запущен</b>\n"
             "Теперь новые сообщения и заказы будут приходить сюда.",
         )
-        print(f"[ok] первый запуск: запомнено {len(sent_messages)} сообщений, "
-              f"{len(sent_orders)} заказов; уведомления — со следующего цикла")
+        print(f"[ok] первый запуск: запомнено {len(pending)} элементов; уведомления — со следующего цикла")
         return 0
 
+    # 4. Отправка. Прогресс сохраняем в любом случае (finally), чтобы временный сбой
+    #    в середине не приводил к повторной рассылке уже доставленных уведомлений.
     sent_count = 0
-    for text in new_message_notifications + new_order_notifications:
-        telegram_send(bot_token, chat_id, text)
-        sent_count += 1
-        time.sleep(0.4)  # не упираться в лимит Telegram
+    try:
+        for kind, _id, text in pending:
+            status = telegram_send(session, bot_token, chat_id, text)
+            if status == "temporary":
+                # не помечаем — повторим в следующем запуске
+                continue
+            # "ok" или "permanent" — помечаем виденным (битое не зацикливаем)
+            (state["sent_message_ids"] if kind == "msg" else state["sent_order_ids"]).append(_id)
+            if status == "ok":
+                sent_count += 1
+            time.sleep(0.4)  # не упираться в лимит Telegram
+    finally:
+        save_state(state_file, state)
 
-    save_state(state_file, state)
     print(f"[ok] {datetime.now(timezone.utc).isoformat()} — отправлено уведомлений: {sent_count} "
-          f"(сообщений: {len(new_message_notifications)}, заказов: {len(new_order_notifications)})")
+          f"(кандидатов было: {len(pending)})")
     return 0
 
 
