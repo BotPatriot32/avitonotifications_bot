@@ -1,7 +1,6 @@
 {
   "initialized": true,
   "sent_message_ids": [
-    "c2d053bcdbd2011cc61effb695468f40",
     "bbc7f1225357f6d94d7f3b782c30faaa",
     "a325d30bf9c1240dac149560734b678f",
     "709b2b4f1b7dbcd9971d2286d8639bfc",
@@ -1000,7 +999,8 @@
     "5248d3fbaa4d423b32be3afa64bba8f7",
     "cd770e584619b9511b8278964efe222c",
     "17dfbdd9b5f7cb235a77c0d577b8f6a3",
-    "4f299d5c69012fe5de4c9ed321a05778"
+    "4f299d5c69012fe5de4c9ed321a05778",
+    "b44fff084578b06d814c763aa4a06f09"
   ],
   "sent_order_ids": [
     "50000000417939062",
